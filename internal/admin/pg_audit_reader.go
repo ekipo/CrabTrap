@@ -13,8 +13,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/brexhq/CrabTrap/internal/db"
 	"github.com/brexhq/CrabTrap/internal/builder"
+	"github.com/brexhq/CrabTrap/internal/db"
 	"github.com/brexhq/CrabTrap/pkg/types"
 )
 
@@ -65,6 +65,7 @@ type AuditReaderIface interface {
 	Query(filter AuditFilter) []types.AuditEntry
 	QueryBatched(ctx context.Context, filter AuditFilter, batchSize int, fn func([]types.AuditEntry) error) error
 	Count(ctx context.Context, filter AuditFilter) (int, error)
+	UpdateResponse(requestID string, responseStatus int, responseHeaders http.Header, responseBody, errText string, durationMs int64) error
 	GetEntry(id string) (*types.AuditEntry, error)
 	GetPolicyStats(policyID string) (*PolicyStats, error)
 }
@@ -109,20 +110,20 @@ type PolicyStats struct {
 
 // AuditFilter contains filter criteria for querying audit entries.
 type AuditFilter struct {
-	ID              string
-	UserID          string
-	Decision        string
-	ApprovedBy      string
-	CacheHit        *bool
-	Channel         string
-	ExcludeChannels    []string
-	ExcludeApprovedBy  []string
-	Method             string
-	PolicyID        string
-	StartTime       time.Time
-	EndTime         time.Time
-	Limit           int
-	Offset          int
+	ID                string
+	UserID            string
+	Decision          string
+	ApprovedBy        string
+	CacheHit          *bool
+	Channel           string
+	ExcludeChannels   []string
+	ExcludeApprovedBy []string
+	Method            string
+	PolicyID          string
+	StartTime         time.Time
+	EndTime           time.Time
+	Limit             int
+	Offset            int
 }
 
 // PGAuditReader implements AuditReaderIface using PostgreSQL.
@@ -189,6 +190,42 @@ func (r *PGAuditReader) Add(entry types.AuditEntry) {
 	if err != nil {
 		slog.Error("PGAuditReader.Add error", "error", err)
 	}
+}
+
+// UpdateResponse updates the latest audit_log row for requestID with the final
+// streamed response details once the body has been fully consumed or closed.
+func (r *PGAuditReader) UpdateResponse(requestID string, responseStatus int, responseHeaders http.Header, responseBody, errText string, durationMs int64) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	respHeadersJSON, err := json.Marshal(responseHeaders)
+	if err != nil {
+		return fmt.Errorf("UpdateResponse: marshal response headers: %w", err)
+	}
+	tag, err := r.pool.Exec(ctx, `
+		WITH target AS (
+			SELECT id
+			FROM audit_log
+			WHERE request_id = $1
+			ORDER BY timestamp DESC
+			LIMIT 1
+		)
+		UPDATE audit_log al
+		SET response_status = $2,
+			duration_ms = $3,
+			error = $4,
+			response_headers = $5,
+			response_body = $6
+		FROM target
+		WHERE al.id = target.id
+	`, requestID, responseStatus, durationMs, sanitizeUTF8(errText), json.RawMessage(respHeadersJSON), sanitizeUTF8(responseBody))
+	if err != nil {
+		return fmt.Errorf("UpdateResponse: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("UpdateResponse: audit entry not found for request_id %s", requestID)
+	}
+	return nil
 }
 
 // buildAuditQueryConditions builds the WHERE clause components for audit_log

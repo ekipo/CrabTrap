@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -43,6 +44,11 @@ const maxBufferedBodySize = 10 * 1024 * 1024 // 10MB
 // entries. Bodies larger than this are truncated to avoid memory spikes when
 // denied (or otherwise logged) requests carry large payloads.
 const maxAuditBodySize = 8192 // 8KB
+
+// maxStreamingAuditSampleSize is the capped response prefix retained for audit
+// updates when a response is streamed to the client before the upstream body is
+// fully buffered.
+const maxStreamingAuditSampleSize = 256 * 1024 // 256KB
 
 // blockedNetworks contains CIDR ranges that the proxy must not connect to
 // by default (SSRF protection). These cover loopback, link-local, and
@@ -374,6 +380,210 @@ func errorResponse(statusCode int, contentType, body string) *http.Response {
 		Header:        h,
 		ContentLength: int64(len(b)),
 	}
+}
+
+type responseAuditBody struct {
+	body            io.ReadCloser
+	requestID       string
+	responseStatus  int
+	responseHeaders http.Header
+	contentEncoding string
+	startTime       time.Time
+	sampleLimit     int
+	updateResponse  func(responseBody, errText string, durationMs int64)
+	formatBody      func([]byte, string) string
+
+	mu        sync.Mutex
+	sample    []byte
+	truncated bool
+	eof       bool
+	readErr   error
+	once      sync.Once
+}
+
+func newResponseAuditBody(body io.ReadCloser, requestID string, responseStatus int, responseHeaders http.Header, contentEncoding string, startTime time.Time, updateResponse func(responseBody, errText string, durationMs int64), formatBody func([]byte, string) string) *responseAuditBody {
+	prealloc := maxStreamingAuditSampleSize
+	if prealloc > 32*1024 {
+		prealloc = 32 * 1024
+	}
+	return &responseAuditBody{
+		body:            body,
+		requestID:       requestID,
+		responseStatus:  responseStatus,
+		responseHeaders: responseHeaders,
+		contentEncoding: contentEncoding,
+		startTime:       startTime,
+		sampleLimit:     maxStreamingAuditSampleSize,
+		updateResponse:  updateResponse,
+		formatBody:      formatBody,
+		sample:          make([]byte, 0, prealloc),
+	}
+}
+
+func (b *responseAuditBody) Read(p []byte) (int, error) {
+	n, err := b.body.Read(p)
+
+	b.mu.Lock()
+	if n > 0 {
+		b.captureLocked(p[:n])
+	}
+	if err == io.EOF {
+		b.eof = true
+	} else if err != nil {
+		b.readErr = err
+	}
+	shouldFinalize := err != nil
+	b.mu.Unlock()
+
+	if shouldFinalize {
+		b.finalize()
+	}
+	return n, err
+}
+
+func (b *responseAuditBody) Close() error {
+	err := b.body.Close()
+	if err != nil {
+		b.mu.Lock()
+		if b.readErr == nil {
+			b.readErr = err
+		}
+		b.mu.Unlock()
+	}
+	b.finalize()
+	return err
+}
+
+func (b *responseAuditBody) captureLocked(chunk []byte) {
+	if b.sampleLimit <= 0 {
+		b.truncated = true
+		return
+	}
+	remaining := b.sampleLimit - len(b.sample)
+	if remaining <= 0 {
+		b.truncated = true
+		return
+	}
+	if len(chunk) > remaining {
+		b.sample = append(b.sample, chunk[:remaining]...)
+		b.truncated = true
+		return
+	}
+	b.sample = append(b.sample, chunk...)
+}
+
+func (b *responseAuditBody) finalize() {
+	b.once.Do(func() {
+		defer func() {
+			if r := recover(); r != nil {
+				slog.Error("panic finalizing streamed response audit", "request_id", b.requestID, "panic", r)
+			}
+		}()
+
+		b.mu.Lock()
+		sample := append([]byte(nil), b.sample...)
+		truncated := b.truncated
+		incomplete := !b.eof
+		readErr := b.readErr
+		b.mu.Unlock()
+
+		if readErr != nil {
+			slog.Error("failed to read streamed response body", "request_id", b.requestID, "error", readErr)
+		}
+
+		loggableBody := responseBodyForAudit(sample, b.contentEncoding, truncated, incomplete, b.requestID)
+		b.logResponseDebug(loggableBody, truncated, incomplete)
+
+		if b.updateResponse != nil {
+			errText := ""
+			if readErr != nil {
+				errText = readErr.Error()
+			}
+			b.updateResponse(string(loggableBody), errText, time.Since(b.startTime).Milliseconds())
+		}
+	})
+}
+
+func (b *responseAuditBody) logResponseDebug(loggableBody []byte, truncated, incomplete bool) {
+	if truncated {
+		slog.Debug("response body audit sample truncated", "request_id", b.requestID, "max_bytes", b.sampleLimit)
+	}
+	if incomplete {
+		slog.Debug("response body closed before EOF during streaming", "request_id", b.requestID)
+	}
+	if !slog.Default().Enabled(context.Background(), slog.LevelDebug) {
+		return
+	}
+
+	slog.Debug("response", "request_id", b.requestID, "status", b.responseStatus)
+
+	importantHeaders := []string{"Content-Type", "Content-Length", "Content-Encoding", "Cache-Control"}
+	for _, key := range importantHeaders {
+		if value := b.responseHeaders.Get(key); value != "" {
+			slog.Debug("response header", "request_id", b.requestID, "key", key, "value", value)
+		}
+	}
+
+	if len(loggableBody) > 0 {
+		slog.Debug("response body", "request_id", b.requestID, "body", b.formatBody(loggableBody, b.requestID))
+	}
+}
+
+func responseBodyForAudit(body []byte, contentEncoding string, truncated, incomplete bool, requestID string) []byte {
+	loggableBody := append([]byte(nil), body...)
+	decompressed := false
+	if strings.Contains(strings.ToLower(contentEncoding), "gzip") && len(loggableBody) > 0 {
+		if decoded, ok, decodedTruncated := decompressGzipResponsePrefix(loggableBody, requestID); ok {
+			loggableBody = decoded
+			decompressed = true
+			truncated = truncated || decodedTruncated
+		}
+	}
+
+	switch {
+	case truncated && decompressed:
+		return appendAuditMarker(loggableBody, "[decompressed response body truncated for logging]")
+	case truncated:
+		return appendAuditMarker(loggableBody, "[response body truncated for logging]")
+	case incomplete && decompressed:
+		return appendAuditMarker(loggableBody, "[decompressed response body incomplete while streaming to client]")
+	case incomplete:
+		return appendAuditMarker(loggableBody, "[response body incomplete while streaming to client]")
+	default:
+		return loggableBody
+	}
+}
+
+func decompressGzipResponsePrefix(body []byte, requestID string) ([]byte, bool, bool) {
+	gzipReader, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		slog.Error("failed to create gzip reader", "request_id", requestID, "error", err)
+		return body, false, false
+	}
+	decompressed, err := io.ReadAll(io.LimitReader(gzipReader, maxBufferedBodySize+1))
+	gzipReader.Close()
+	if err != nil {
+		if len(decompressed) > 0 {
+			return decompressed, true, true
+		}
+		slog.Error("failed to decompress gzip body", "request_id", requestID, "error", err)
+		return body, false, false
+	}
+	if len(decompressed) > maxBufferedBodySize {
+		return decompressed[:maxBufferedBodySize], true, true
+	}
+	return decompressed, true, false
+}
+
+func appendAuditMarker(body []byte, marker string) []byte {
+	if len(body) == 0 {
+		return []byte(marker)
+	}
+	out := make([]byte, 0, len(body)+len(marker)+1)
+	out = append(out, body...)
+	out = append(out, '\n')
+	out = append(out, marker...)
+	return out
 }
 
 // proxyAuth holds the credentials extracted from a Proxy-Authorization header.
@@ -1482,7 +1692,34 @@ func (h *Handler) processRequest(r *http.Request, requestID string, startTime ti
 		return errorResponse(http.StatusBadGateway, "text/plain", "Failed to forward request")
 	}
 
-	// Read and log response body (capped to avoid OOM on large downloads).
+	auditResponseHeaders := resp.Header.Clone()
+	if shouldStreamResponse(resp) {
+		e := newEntry(requestID, r, originalHeaders, startTime, requestUserID)
+		e.Decision = "approved"
+		e.CacheHit = decision.ApprovedBy == "cache"
+		e.ResponseStatus = resp.StatusCode
+		e.RequestBody = truncateBodyForAudit(originalRequestBody)
+		e.ResponseHeaders = auditResponseHeaders.Clone()
+		applyDecision(&e, decision, llmResponseID, decision.Reason)
+		h.logEntry(e)
+
+		streamHeaders := auditResponseHeaders.Clone()
+		resp.Body = newResponseAuditBody(
+			resp.Body,
+			requestID,
+			resp.StatusCode,
+			streamHeaders,
+			resp.Header.Get("Content-Encoding"),
+			startTime,
+			func(responseBody, errText string, durationMs int64) {
+				h.updateResponseAudit(requestID, resp.StatusCode, streamHeaders, responseBody, errText, durationMs)
+			},
+			h.formatBody,
+		)
+		return resp
+	}
+
+	// Read and log response body (capped to avoid OOM on buffered responses).
 	respLR := &io.LimitedReader{R: resp.Body, N: maxBufferedBodySize + 1}
 	responseBody, err := io.ReadAll(respLR)
 	if err != nil {
@@ -1494,7 +1731,7 @@ func (h *Handler) processRequest(r *http.Request, requestID string, startTime ti
 		e.ResponseStatus = 502
 		e.Error = err.Error()
 		e.RequestBody = truncateBodyForAudit(originalRequestBody)
-		e.ResponseHeaders = resp.Header.Clone()
+		e.ResponseHeaders = auditResponseHeaders.Clone()
 
 		applyDecision(&e, decision, llmResponseID, decision.Reason)
 		h.logEntry(e)
@@ -1502,23 +1739,18 @@ func (h *Handler) processRequest(r *http.Request, requestID string, startTime ti
 	}
 	if respLR.N == 0 {
 		// Body exceeds cap — reconstruct full stream for the client and log with truncation note.
-		// Use multiReadCloser so Close() still reaches the original body and returns the
-		// underlying TCP connection to the pool even if the caller doesn't drain fully.
 		resp.Body = &multiReadCloser{
 			Reader: io.MultiReader(bytes.NewReader(responseBody), respLR.R),
 			closer: resp.Body,
 		}
-		suffix := []byte("\n[response body truncated for logging]")
-		truncatedBody := make([]byte, len(responseBody), len(responseBody)+len(suffix))
-		copy(truncatedBody, responseBody)
-		truncatedBody = append(truncatedBody, suffix...)
+		truncatedBody := appendAuditMarker(responseBody, "[response body truncated for logging]")
 		slog.Debug("response body exceeds buffer size, streaming without full buffering", "request_id", requestID, "max_bytes", maxBufferedBodySize)
 		e := newEntry(requestID, r, originalHeaders, startTime, requestUserID)
 		e.Decision = "approved"
 		e.CacheHit = decision.ApprovedBy == "cache"
 		e.ResponseStatus = resp.StatusCode
 		e.RequestBody = truncateBodyForAudit(originalRequestBody)
-		e.ResponseHeaders = resp.Header.Clone()
+		e.ResponseHeaders = auditResponseHeaders.Clone()
 		e.ResponseBody = string(truncatedBody)
 
 		applyDecision(&e, decision, llmResponseID, decision.Reason)
@@ -1527,24 +1759,14 @@ func (h *Handler) processRequest(r *http.Request, requestID string, startTime ti
 	}
 	resp.Body.Close()
 
-	// Decompress response body if needed for logging
+	// Decompress response body if needed for logging.
 	loggableBody := responseBody
 	contentEncoding := resp.Header.Get("Content-Encoding")
 	if strings.Contains(strings.ToLower(contentEncoding), "gzip") {
-		gzipReader, err := gzip.NewReader(bytes.NewReader(responseBody))
-		if err != nil {
-			slog.Error("failed to create gzip reader", "request_id", requestID, "error", err)
-		} else {
-			// Read up to maxBufferedBodySize+1 to detect whether the
-			// decompressed output exceeds the cap.
-			decompressed, err := io.ReadAll(io.LimitReader(gzipReader, maxBufferedBodySize+1))
-			gzipReader.Close()
-			if err != nil {
-				slog.Error("failed to decompress gzip body", "request_id", requestID, "error", err)
-			} else if int64(len(decompressed)) > maxBufferedBodySize {
-				loggableBody = append(decompressed[:maxBufferedBodySize], []byte("\n[decompressed response body truncated for logging]")...)
-			} else {
-				loggableBody = decompressed
+		if decoded, ok, decodedTruncated := decompressGzipResponsePrefix(responseBody, requestID); ok {
+			loggableBody = decoded
+			if decodedTruncated {
+				loggableBody = appendAuditMarker(loggableBody, "[decompressed response body truncated for logging]")
 			}
 		}
 	}
@@ -1564,16 +1786,16 @@ func (h *Handler) processRequest(r *http.Request, requestID string, startTime ti
 		}
 	}
 
-	// Restore response body so it can be used by caller
+	// Restore response body so it can be used by caller.
 	resp.Body = io.NopCloser(bytes.NewReader(responseBody))
 
-	// Log audit
+	// Log audit.
 	e := newEntry(requestID, r, originalHeaders, startTime, requestUserID)
 	e.Decision = "approved"
 	e.CacheHit = decision.ApprovedBy == "cache"
 	e.ResponseStatus = resp.StatusCode
 	e.RequestBody = truncateBodyForAudit(originalRequestBody)
-	e.ResponseHeaders = resp.Header.Clone()
+	e.ResponseHeaders = auditResponseHeaders.Clone()
 	e.ResponseBody = string(loggableBody)
 	applyDecision(&e, decision, llmResponseID, decision.Reason)
 	h.logEntry(e)
@@ -1630,6 +1852,34 @@ func (h *Handler) logEntry(entry types.AuditEntry) {
 		h.auditReader.Add(entry)
 	}
 	h.auditLogger.LogRequest(entry)
+}
+
+func (h *Handler) updateResponseAudit(requestID string, responseStatus int, responseHeaders http.Header, responseBody, errText string, durationMs int64) {
+	if h.auditReader == nil {
+		slog.Warn("streamed response audit update skipped because audit reader is not configured", "request_id", requestID)
+		return
+	}
+	if err := h.auditReader.UpdateResponse(requestID, responseStatus, responseHeaders, responseBody, errText, durationMs); err != nil {
+		slog.Error("failed to update streamed response audit", "request_id", requestID, "error", err)
+	}
+}
+
+func shouldStreamResponse(resp *http.Response) bool {
+	if resp.ContentLength > maxBufferedBodySize {
+		return true
+	}
+	// Unknown-length responses cannot be bounded without reading to EOF first;
+	// stream them so chunked/close-delimited dynamic responses are not buffered.
+	if resp.ContentLength == -1 {
+		return true
+	}
+	for _, encoding := range resp.TransferEncoding {
+		if strings.EqualFold(encoding, "chunked") {
+			return true
+		}
+	}
+	contentType := strings.ToLower(resp.Header.Get("Content-Type"))
+	return strings.Contains(contentType, "text/event-stream")
 }
 
 // stripHopByHopHeaders removes hop-by-hop headers from the given header map

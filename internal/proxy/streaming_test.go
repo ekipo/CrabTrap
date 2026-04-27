@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -31,6 +33,19 @@ func makeLargeBody(size int) []byte {
 	return b
 }
 
+func gzipTestBody(t *testing.T, body []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(body); err != nil {
+		t.Fatalf("write gzip body: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
 // newStreamingTestHandler builds a Handler with passthrough approval and no credential manager.
 // It truncates test tables as a side effect (via newTestManager).
 func newStreamingTestHandler(t *testing.T, auditFile string) *Handler {
@@ -50,6 +65,19 @@ func newStreamingTestHandler(t *testing.T, auditFile string) *Handler {
 	return h
 }
 
+func TestResponseBodyForAuditMarksGzipDecompressionTruncation(t *testing.T) {
+	compressed := gzipTestBody(t, bytes.Repeat([]byte("A"), maxBufferedBodySize+1))
+
+	got := responseBodyForAudit(compressed, "gzip", false, false, "req_gzip_truncated")
+
+	if !bytes.Contains(got, []byte("[decompressed response body truncated for logging]")) {
+		t.Fatalf("expected decompressed truncation marker in audit body")
+	}
+	if bytes.Contains(got, compressed[:min(64, len(compressed))]) {
+		t.Fatalf("audit body still appears to contain compressed bytes")
+	}
+}
+
 // TestLargeResponseIsStreamed verifies that processRequest returns before the backend has
 // finished sending the full body — i.e., the response is streamed, not fully buffered.
 //
@@ -60,6 +88,7 @@ func newStreamingTestHandler(t *testing.T, auditFile string) *Handler {
 func TestLargeResponseIsStreamed(t *testing.T) {
 	first := makeLargeBody(maxBufferedBodySize + 1) // exactly enough to trigger the cap
 	tail := []byte("streaming-tail-sentinel")
+	auditFile := filepath.Join(t.TempDir(), "audit.jsonl")
 	unblock := make(chan struct{})
 	defer func() {
 		// Ensure the backend goroutine is unblocked on early test exit (e.g. timeout).
@@ -71,6 +100,7 @@ func TestLargeResponseIsStreamed(t *testing.T) {
 	}()
 
 	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(first)+len(tail)))
 		w.Write(first)
 		w.(http.Flusher).Flush() // push bytes to the proxy before blocking
 		<-unblock                // block here — tail not sent yet
@@ -78,7 +108,7 @@ func TestLargeResponseIsStreamed(t *testing.T) {
 	}))
 	defer backend.Close()
 
-	handler := newStreamingTestHandler(t, filepath.Join(t.TempDir(), "audit.jsonl"))
+	handler := newStreamingTestHandler(t, auditFile)
 
 	respCh := make(chan *http.Response, 1)
 	go func() {
@@ -96,6 +126,10 @@ func TestLargeResponseIsStreamed(t *testing.T) {
 		if resp.StatusCode != http.StatusOK {
 			t.Fatalf("expected 200, got %d", resp.StatusCode)
 		}
+		entries := readAuditEntries(t, auditFile)
+		if len(entries) == 0 {
+			t.Fatal("expected streamed response audit entry to be written before body completion")
+		}
 		// Now unblock the backend so it sends the tail.
 		close(unblock)
 		received, err := io.ReadAll(resp.Body)
@@ -110,6 +144,113 @@ func TestLargeResponseIsStreamed(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("processRequest blocked waiting for full body — body is being fully buffered instead of streamed")
+	}
+}
+
+// TestEventStreamResponseIsStreamedBeforeCompletion verifies that streaming-like
+// responses are returned before the upstream completes the body.
+func TestEventStreamResponseIsStreamedBeforeCompletion(t *testing.T) {
+	first := []byte("data: first event\n\n")
+	tail := []byte("data: second event\n\n")
+	unblock := make(chan struct{})
+	defer func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+	}()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write(first)
+		w.(http.Flusher).Flush()
+		<-unblock
+		w.Write(tail)
+	}))
+	defer backend.Close()
+
+	handler := newStreamingTestHandler(t, filepath.Join(t.TempDir(), "audit.jsonl"))
+
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		req, _ := http.NewRequest("GET", backend.URL+"/stream-events", nil)
+		req.URL.Scheme = "http"
+		respCh <- handler.processRequest(req, "req_event_stream_verify", time.Now(), context.Background())
+	}()
+
+	select {
+	case resp := <-respCh:
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		close(unblock)
+		received, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading body: %v", err)
+		}
+		want := append(append([]byte(nil), first...), tail...)
+		if !bytes.Equal(received, want) {
+			t.Errorf("received %q, want %q", received, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("processRequest blocked waiting for the full response body before returning")
+	}
+}
+
+// TestChunkedResponseIsStreamedBeforeCompletion verifies that unknown-length
+// chunked responses avoid the buffered path and return before the upstream
+// completes the body.
+func TestChunkedResponseIsStreamedBeforeCompletion(t *testing.T) {
+	first := []byte("chunked-prefix")
+	tail := []byte("chunked-tail")
+	unblock := make(chan struct{})
+	defer func() {
+		select {
+		case <-unblock:
+		default:
+			close(unblock)
+		}
+	}()
+
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(first)
+		w.(http.Flusher).Flush()
+		<-unblock
+		w.Write(tail)
+	}))
+	defer backend.Close()
+
+	handler := newStreamingTestHandler(t, filepath.Join(t.TempDir(), "audit.jsonl"))
+
+	respCh := make(chan *http.Response, 1)
+	go func() {
+		req, _ := http.NewRequest("GET", backend.URL+"/chunked", nil)
+		req.URL.Scheme = "http"
+		respCh <- handler.processRequest(req, "req_chunked_stream_verify", time.Now(), context.Background())
+	}()
+
+	select {
+	case resp := <-respCh:
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("expected 200, got %d", resp.StatusCode)
+		}
+		if resp.ContentLength != -1 {
+			t.Fatalf("expected unknown content length, got %d", resp.ContentLength)
+		}
+		close(unblock)
+		received, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("reading body: %v", err)
+		}
+		want := append(append([]byte(nil), first...), tail...)
+		if !bytes.Equal(received, want) {
+			t.Errorf("received %q, want %q", received, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("processRequest blocked waiting for the full chunked response body before returning")
 	}
 }
 
