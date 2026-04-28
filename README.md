@@ -113,6 +113,34 @@ crabtrap/
 └── scripts/              # Certificate generation, database migrations
 ```
 
+## Observability
+
+CrabTrap ships an optional OpenTelemetry metric surface, exposed in Prometheus scrape format on a dedicated HTTP listener. Disabled by default.
+
+Enable it in `config/gateway.yaml`:
+
+```yaml
+observability:
+  metrics:
+    enabled: true                # default: false
+    listen: "127.0.0.1:9090"     # bind address (default loopback)
+```
+
+The metrics listener is separate from the admin and proxy ports. It serves only `/metrics` and requires no auth — Prometheus scrapers do not need admin credentials. Network exposure is controlled by the `listen` bind address: the default `127.0.0.1:9090` keeps the surface on loopback so no operator action is required to keep it private. To scrape from another host, change `listen` to a private interface address (e.g. `10.0.1.42:9090`) and reach it from inside the trust boundary.
+
+Minimal Prometheus scrape config (loopback bind, scraper on the same host):
+
+```yaml
+scrape_configs:
+  - job_name: crabtrap
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+    metrics_path: /metrics
+    scrape_interval: 15s
+```
+
+The current metric surface includes counters for rate-limit hits and approval decisions, a gauge per LLM provider for circuit-breaker state, histograms for judge and approval latency, and a `crabtrap_build_info` gauge that lets operators correlate metric anomalies with deployments. See [docs/observability.md](docs/observability.md) for the full metric catalog, alert suggestions, and cardinality notes.
+
 ## Development
 
 ```bash

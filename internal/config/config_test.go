@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -160,6 +161,145 @@ func TestDefaultConfigIsValid(t *testing.T) {
 	if err := config.validate(); err != nil {
 		t.Fatalf("Default() should produce a valid config, but validate() returned: %v", err)
 	}
+}
+
+func TestObservabilityMetricsLoadFromYAML(t *testing.T) {
+	configContent := `
+proxy:
+  port: 8080
+
+tls:
+  ca_cert_path: ./certs/ca.crt
+  ca_key_path: ./certs/ca.key
+
+approval:
+  mode: passthrough
+
+audit:
+  output: stderr
+  format: json
+
+database:
+  url: "postgres://localhost/x"
+
+observability:
+  metrics:
+    enabled: true
+`
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "metrics-config.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.Observability.Metrics.Enabled {
+		t.Fatal("expected observability.metrics.enabled to be true")
+	}
+}
+
+func TestObservabilityMetricsDefaultDisabled(t *testing.T) {
+	cfg := Default()
+	if cfg.Observability.Metrics.Enabled {
+		t.Fatal("observability.metrics.enabled should default to false")
+	}
+}
+
+func TestObservabilityMetricsListenDefaultsToLoopback(t *testing.T) {
+	configContent := `
+proxy:
+  port: 8080
+tls:
+  ca_cert_path: ./certs/ca.crt
+  ca_key_path: ./certs/ca.key
+approval:
+  mode: passthrough
+audit:
+  format: json
+database:
+  url: "postgres://localhost/x"
+observability:
+  metrics:
+    enabled: true
+`
+	cfg := mustLoadConfig(t, configContent)
+	if cfg.Observability.Metrics.Listen != "127.0.0.1:9090" {
+		t.Fatalf("listen defaulted to %q, want %q", cfg.Observability.Metrics.Listen, "127.0.0.1:9090")
+	}
+}
+
+func TestObservabilityMetricsListenHonorsExplicitValue(t *testing.T) {
+	configContent := `
+proxy:
+  port: 8080
+tls:
+  ca_cert_path: ./certs/ca.crt
+  ca_key_path: ./certs/ca.key
+approval:
+  mode: passthrough
+audit:
+  format: json
+database:
+  url: "postgres://localhost/x"
+observability:
+  metrics:
+    enabled: true
+    listen: "0.0.0.0:9999"
+`
+	cfg := mustLoadConfig(t, configContent)
+	if cfg.Observability.Metrics.Listen != "0.0.0.0:9999" {
+		t.Fatalf("listen = %q, want %q", cfg.Observability.Metrics.Listen, "0.0.0.0:9999")
+	}
+}
+
+func TestObservabilityMetricsListenRejectsMalformedValue(t *testing.T) {
+	configContent := `
+proxy:
+  port: 8080
+tls:
+  ca_cert_path: ./certs/ca.crt
+  ca_key_path: ./certs/ca.key
+approval:
+  mode: passthrough
+audit:
+  format: json
+database:
+  url: "postgres://localhost/x"
+observability:
+  metrics:
+    enabled: true
+    listen: "not-a-host-port"
+`
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "metrics-bogus-listen.yaml")
+	if err := os.WriteFile(configPath, []byte(configContent), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+	_, err := Load(configPath)
+	if err == nil {
+		t.Fatal("expected validation error for malformed listen value")
+	}
+	if !strings.Contains(err.Error(), "listen") {
+		t.Errorf("error should reference listen, got: %v", err)
+	}
+}
+
+// mustLoadConfig writes content to a tmp file, loads it, and fails the test on error.
+func mustLoadConfig(t *testing.T, content string) *Config {
+	t.Helper()
+	tmpDir := t.TempDir()
+	configPath := filepath.Join(tmpDir, "config.yaml")
+	if err := os.WriteFile(configPath, []byte(content), 0644); err != nil {
+		t.Fatalf("Failed to write test config: %v", err)
+	}
+	cfg, err := Load(configPath)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	return cfg
 }
 
 func TestValidateApprovalModeRejectsManual(t *testing.T) {

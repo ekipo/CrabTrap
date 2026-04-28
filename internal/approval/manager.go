@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/brexhq/CrabTrap/internal/judge"
 	"github.com/brexhq/CrabTrap/pkg/types"
@@ -36,12 +37,27 @@ const ContextKeyOriginalBody contextKey = "original_body"
 // large uploads may still have an unread streaming tail attached to req.Body.
 const ContextKeyBufferedBody contextKey = "buffered_body"
 
+// DecisionObserver is notified about the final approval decision and the
+// end-to-end pipeline latency. Implementations must be safe for concurrent
+// use. The hook is optional: a nil observer disables recording. Kept as a
+// small interface to avoid a dependency on internal/metrics from the approval
+// package.
+//
+// Fires only on successful (non-error) returns from CheckApproval; malformed
+// requests that error out before a decision is reached are excluded from both
+// counter and histogram.
+type DecisionObserver interface {
+	OnApprovalDecision(outcome, mode string)
+	OnApprovalLatency(mode, outcome string, d time.Duration)
+}
+
 // Manager orchestrates the approval decision flow
 type Manager struct {
 	judge        *judge.LLMJudge // nil if LLM mode disabled
 	mode         string          // "llm" | "passthrough"
 	fallbackMode string          // "deny" | "passthrough"
 
+	observer DecisionObserver
 }
 
 // NewManager creates a new approval manager.
@@ -66,10 +82,28 @@ func (m *Manager) SetJudge(j *judge.LLMJudge, mode, fallbackMode string) {
 	m.fallbackMode = fallbackMode
 }
 
+// SetObserver attaches an optional observer that receives each decision. Must
+// be called before the manager starts handling traffic; not intended for
+// concurrent reconfiguration.
+func (m *Manager) SetObserver(obs DecisionObserver) {
+	m.observer = obs
+}
+
 // CheckApproval checks if a request should be allowed.
 // In "llm" mode every request (including GET) is evaluated by the LLM judge; no caching.
 // In "passthrough" mode every request is auto-approved.
 func (m *Manager) CheckApproval(ctx context.Context, req *http.Request, requestID string, apiInfo *types.APIInfo) (types.ApprovalDecision, []byte, error) {
+	start := time.Now()
+	decision, body, err := m.checkApproval(ctx, req, requestID, apiInfo)
+	if m.observer != nil && err == nil {
+		outcome := string(decision.Decision)
+		m.observer.OnApprovalDecision(outcome, m.mode)
+		m.observer.OnApprovalLatency(m.mode, outcome, time.Since(start))
+	}
+	return decision, body, err
+}
+
+func (m *Manager) checkApproval(ctx context.Context, req *http.Request, requestID string, apiInfo *types.APIInfo) (types.ApprovalDecision, []byte, error) {
 	if m.mode == "passthrough" {
 		return types.ApprovalDecision{
 			Decision:   types.DecisionAllow,

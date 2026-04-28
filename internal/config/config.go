@@ -24,16 +24,38 @@ type AdminConfig struct {
 	SecureCookie bool `yaml:"secure_cookie"` // set Secure flag on auth cookies (enable behind TLS proxy)
 }
 
+// ObservabilityConfig groups optional observability features.
+type ObservabilityConfig struct {
+	Metrics MetricsConfig `yaml:"metrics"`
+}
+
+// MetricsConfig controls the OpenTelemetry/Prometheus metrics surface.
+// When enabled, the gateway runs a dedicated HTTP listener that serves
+// `/metrics` in Prometheus text format. The listener is separate from the
+// admin and proxy ports so Prometheus scrapers do not need admin credentials
+// and the surface can be reached over a private network without exposing
+// admin or proxy traffic.
+//
+// Listen controls the bind address. The default `127.0.0.1:9090` keeps the
+// surface on loopback so no operator action is required to keep it private.
+// Operators who scrape from another host should set this explicitly (for
+// example `0.0.0.0:9090` behind a firewall, or a private interface address).
+type MetricsConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"` // host:port, default "127.0.0.1:9090"
+}
+
 // Config represents the gateway configuration
 type Config struct {
-	LogLevel    string            `yaml:"log_level"` // "debug", "info" (default), "warn", "error"
-	Proxy       ProxyConfig       `yaml:"proxy"`
-	TLS         TLSConfig         `yaml:"tls"`
-	Approval    ApprovalConfig    `yaml:"approval"`
-	Audit       AuditConfig       `yaml:"audit"`
-	Database    DatabaseConfig    `yaml:"database"`
-	LLMJudge    LLMJudgeConfig    `yaml:"llm_judge"`
-	Admin       AdminConfig       `yaml:"admin"`
+	LogLevel      string              `yaml:"log_level"` // "debug", "info" (default), "warn", "error"
+	Proxy         ProxyConfig         `yaml:"proxy"`
+	TLS           TLSConfig           `yaml:"tls"`
+	Approval      ApprovalConfig      `yaml:"approval"`
+	Audit         AuditConfig         `yaml:"audit"`
+	Database      DatabaseConfig      `yaml:"database"`
+	LLMJudge      LLMJudgeConfig      `yaml:"llm_judge"`
+	Admin         AdminConfig         `yaml:"admin"`
+	Observability ObservabilityConfig `yaml:"observability"`
 }
 
 // ProxyConfig contains proxy server settings
@@ -235,6 +257,9 @@ func (c *Config) applyDefaults() {
 	if *c.Proxy.RateLimitPerIP > 0 && c.Proxy.RateLimitBurst == 0 {
 		c.Proxy.RateLimitBurst = 100
 	}
+	if c.Observability.Metrics.Enabled && c.Observability.Metrics.Listen == "" {
+		c.Observability.Metrics.Listen = "127.0.0.1:9090"
+	}
 }
 
 // validate checks if the configuration is valid
@@ -308,6 +333,16 @@ func (c *Config) validate() error {
 	}
 	if c.Proxy.RateLimitBurst < 0 {
 		return fmt.Errorf("rate_limit_burst must be non-negative (got %d)", c.Proxy.RateLimitBurst)
+	}
+
+	if c.Observability.Metrics.Enabled {
+		listen := c.Observability.Metrics.Listen
+		if listen == "" {
+			return fmt.Errorf("observability.metrics.listen is required when metrics are enabled (default: 127.0.0.1:9090)")
+		}
+		if _, _, err := net.SplitHostPort(listen); err != nil {
+			return fmt.Errorf("observability.metrics.listen %q is not a valid host:port: %w", listen, err)
+		}
 	}
 
 	return nil
