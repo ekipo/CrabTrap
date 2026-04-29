@@ -476,6 +476,9 @@ func TestStaticURLMatches(t *testing.T) {
 		{"https://api.example.com/repos/123/extra/comments", "api.example.com/repos/*/comments", "glob", true},  // * crosses /
 		{"https://api.example.com/repos/comments",           "api.example.com/repos/*/comments", "glob", false}, // empty segment — * requires at least one char
 		{"https://api.example.com/repos/123/comments/extra", "api.example.com/repos/*/comments", "glob", false}, // trailing extra
+		// glob with scheme in the pattern — scheme stripped symmetrically so it still matches
+		{"https://api.github.com/repos/owner/repo/readme", "https://api.github.com/repos/*/*/readme", "glob", true},
+		{"https://api.github.com/repos/owner/repo/readme", "http://api.github.com/repos/*/*/readme", "glob", true}, // scheme in pattern is ignored
 		// default port normalisation — :443 for https, :80 for http
 		{"https://brex.okta.com:443/.well-known/openid-configuration", "https://brex.okta.com/", "prefix", true},
 		{"https://brex.okta.com/.well-known/openid-configuration", "https://brex.okta.com:443/", "prefix", true},
