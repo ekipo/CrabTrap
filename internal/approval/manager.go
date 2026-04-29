@@ -419,12 +419,19 @@ func staticURLMatches(urlStr, pattern, matchType string) bool {
 	case "exact":
 		return decoded == normalizedPattern
 	case "glob":
-		// Strip scheme (e.g. "https://") so patterns like "*.example.com/*" work.
+		// Strip scheme (e.g. "https://") from both the URL and the pattern so
+		// that patterns authored with or without a scheme behave identically.
+		// The URL string reconstructed by the proxy always carries a scheme;
+		// user-authored patterns may or may not.
 		stripped := decoded
 		if i := strings.Index(decoded, "://"); i >= 0 {
 			stripped = decoded[i+3:]
 		}
-		re, err := globToRegexp(normalizedPattern)
+		patternForGlob := normalizedPattern
+		if i := strings.Index(normalizedPattern, "://"); i >= 0 {
+			patternForGlob = normalizedPattern[i+3:]
+		}
+		re, err := globToRegexp(patternForGlob)
 		if err != nil {
 			return false
 		}
