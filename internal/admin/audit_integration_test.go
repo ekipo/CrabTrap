@@ -146,6 +146,123 @@ func TestAudit_LLMPolicyID_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestAuditList_OmitsPayloadsAndUsesLimitPlusOnePagination(t *testing.T) {
+	if testPool == nil {
+		t.Skip("no test database")
+	}
+	truncateTables(t)
+	api, reader, _, _ := newAuditAPI(t)
+
+	now := time.Now()
+	reader.Add(types.AuditEntry{
+		Timestamp:       now,
+		RequestID:       "payload-list-1",
+		Method:          "POST",
+		URL:             "/payload",
+		Operation:       "WRITE",
+		Decision:        "approved",
+		Channel:         "llm",
+		ResponseStatus:  200,
+		DurationMs:      25,
+		RequestHeaders:  http.Header{"Content-Type": []string{"application/json"}},
+		RequestBody:     `{"secret":"request"}`,
+		ResponseHeaders: http.Header{"Content-Type": []string{"application/json"}},
+		ResponseBody:    `{"secret":"response"}`,
+	})
+	reader.Add(types.AuditEntry{
+		Timestamp:       now.Add(time.Second),
+		RequestID:       "payload-list-2",
+		Method:          "POST",
+		URL:             "/payload-2",
+		Operation:       "WRITE",
+		Decision:        "approved",
+		Channel:         "llm",
+		ResponseStatus:  200,
+		DurationMs:      30,
+		RequestHeaders:  http.Header{"Content-Type": []string{"application/json"}},
+		RequestBody:     `{"secret":"request-2"}`,
+		ResponseHeaders: http.Header{"Content-Type": []string{"application/json"}},
+		ResponseBody:    `{"secret":"response-2"}`,
+	})
+
+	rr := doEvalRequest(t, api, http.MethodGet, "/admin/audit?limit=1", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /admin/audit: got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(rr.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode raw list response: %v", err)
+	}
+	if _, ok := raw["total"]; ok {
+		t.Fatal("list response includes total; want no exact count query")
+	}
+	var listResp struct {
+		Entries []map[string]interface{} `json:"entries"`
+		Offset  int                      `json:"offset"`
+		Limit   int                      `json:"limit"`
+		HasMore bool                     `json:"has_more"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode list response: %v", err)
+	}
+	if !listResp.HasMore {
+		t.Fatalf("has_more = false, want true")
+	}
+	if listResp.Limit != 1 {
+		t.Fatalf("limit = %d, want 1", listResp.Limit)
+	}
+	if len(listResp.Entries) != 1 {
+		t.Fatalf("entries length = %d, want 1", len(listResp.Entries))
+	}
+	entry := listResp.Entries[0]
+	for _, field := range []string{"request_headers", "request_body", "response_headers", "response_body"} {
+		if _, ok := entry[field]; ok {
+			t.Fatalf("list response includes %s; want payload fields omitted", field)
+		}
+	}
+
+	id, _ := entry["id"].(string)
+	if id == "" {
+		t.Fatal("list response missing audit entry id")
+	}
+	requestID, _ := entry["request_id"].(string)
+	wantRequestBody := `{"secret":"request-2"}`
+	wantResponseBody := `{"secret":"response-2"}`
+	if requestID == "payload-list-1" {
+		wantRequestBody = `{"secret":"request"}`
+		wantResponseBody = `{"secret":"response"}`
+	}
+	rr = doEvalRequest(t, api, http.MethodGet, "/admin/audit/"+id, nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /admin/audit/{id}: got %d: %s", rr.Code, rr.Body.String())
+	}
+	var detail map[string]interface{}
+	if err := json.NewDecoder(rr.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail response: %v", err)
+	}
+	if detail["request_body"] != wantRequestBody {
+		t.Fatalf("detail request_body = %v, want stored body", detail["request_body"])
+	}
+	if detail["response_body"] != wantResponseBody {
+		t.Fatalf("detail response_body = %v, want stored body", detail["response_body"])
+	}
+
+	rr = doEvalRequest(t, api, http.MethodGet, "/admin/audit?limit=1&offset=1", nil)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("GET /admin/audit page 2: got %d: %s", rr.Code, rr.Body.String())
+	}
+	if err := json.NewDecoder(rr.Body).Decode(&listResp); err != nil {
+		t.Fatalf("decode second list response: %v", err)
+	}
+	if listResp.HasMore {
+		t.Fatalf("second page has_more = true, want false")
+	}
+	if len(listResp.Entries) != 1 {
+		t.Fatalf("second page entries length = %d, want 1", len(listResp.Entries))
+	}
+}
+
 // TestAudit_LLMResponseID_RoundTrip verifies that llm_response_id is stored and
 // returned by GET /admin/audit/{id}, with reason populated from the JOIN.
 func TestAudit_LLMResponseID_RoundTrip(t *testing.T) {
