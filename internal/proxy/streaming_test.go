@@ -254,10 +254,9 @@ func TestChunkedResponseIsStreamedBeforeCompletion(t *testing.T) {
 	}
 }
 
-// TestLargeResponseAuditTruncation verifies that the audit log entry written to
-// file does not contain the response body (sensitive payload is stripped from
-// file/stdout output).
-func TestLargeResponseAuditTruncation(t *testing.T) {
+// TestStreamedLargeResponseFileAuditWritesInitialEntry verifies that streamed
+// responses keep the early file audit entry from the merged streaming path.
+func TestStreamedLargeResponseFileAuditWritesInitialEntry(t *testing.T) {
 	data := makeLargeBody(largeBodySize)
 	auditFile := filepath.Join(t.TempDir(), "audit.jsonl")
 
@@ -272,23 +271,30 @@ func TestLargeResponseAuditTruncation(t *testing.T) {
 	req.URL.Scheme = "http"
 
 	resp := handler.processRequest(req, "req_stream_audit", time.Now(), context.Background())
-	io.Copy(io.Discard, resp.Body)
+	received, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response: %v", err)
+	}
 	resp.Body.Close()
+	if len(received) != len(data) {
+		t.Fatalf("received %d bytes, want %d", len(received), len(data))
+	}
 
 	entries := readAuditEntries(t, auditFile)
 	if len(entries) == 0 {
 		t.Fatal("no audit entries written")
 	}
 	e := entries[len(entries)-1]
-	// File/stdout audit output strips response bodies to avoid logging sensitive data.
+	if e.ResponseStatus != http.StatusOK {
+		t.Fatalf("expected status %d, got %d", http.StatusOK, e.ResponseStatus)
+	}
 	if e.ResponseBody != "" {
-		t.Errorf("expected empty ResponseBody in file audit output, got %d bytes", len(e.ResponseBody))
+		t.Fatalf("expected early file audit entry to omit streamed response body, got %q", e.ResponseBody)
 	}
 }
 
 // TestSmallResponseFullyBuffered verifies that responses under maxBufferedBodySize
-// are fully delivered to the client. The file audit output strips the response body
-// to avoid logging sensitive payload data.
+// are fully delivered to the client and preserved in file audit output.
 func TestSmallResponseFullyBuffered(t *testing.T) {
 	data := []byte(`{"message":"small response ok"}`)
 	auditFile := filepath.Join(t.TempDir(), "audit.jsonl")
@@ -323,9 +329,8 @@ func TestSmallResponseFullyBuffered(t *testing.T) {
 		t.Fatal("no audit entries written")
 	}
 	e := entries[len(entries)-1]
-	// File/stdout audit output strips response bodies to avoid logging sensitive data.
-	if e.ResponseBody != "" {
-		t.Errorf("expected empty ResponseBody in file audit output, got %q", e.ResponseBody)
+	if e.ResponseBody != string(data) {
+		t.Errorf("expected ResponseBody %q in file audit output, got %q", data, e.ResponseBody)
 	}
 }
 
