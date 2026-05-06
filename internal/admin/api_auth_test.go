@@ -80,15 +80,35 @@ type stubUserStore struct{}
 
 func (s *stubUserStore) ListUsers() ([]UserSummary, error) { return nil, nil }
 func (s *stubUserStore) GetUser(id string) (*UserDetail, error) {
-	return &UserDetail{ID: id, Channels: []UserChannelInfo{}}, nil
+	role := "user"
+	if strings.Contains(id, "mgr") || strings.Contains(id, "manager") || strings.Contains(id, "admin") {
+		role = "manager"
+	}
+	return &UserDetail{ID: id, Role: role, Channels: []UserChannelInfo{}, Managers: []ManagerAssignment{}}, nil
 }
 func (s *stubUserStore) CreateUser(req CreateUserRequest) (*UserDetail, error) {
-	return &UserDetail{ID: req.ID, Channels: []UserChannelInfo{}}, nil
+	role := "user"
+	if req.Role != nil {
+		role = *req.Role
+	}
+	return &UserDetail{ID: req.ID, Role: role, Channels: []UserChannelInfo{}, Managers: []ManagerAssignment{}}, nil
 }
 func (s *stubUserStore) UpdateUser(id string, req UpdateUserRequest) (*UserDetail, error) {
-	return &UserDetail{ID: id, Channels: []UserChannelInfo{}}, nil
+	return &UserDetail{ID: id, Channels: []UserChannelInfo{}, Managers: []ManagerAssignment{}}, nil
 }
-func (s *stubUserStore) DeleteUser(id string) error { return nil }
+func (s *stubUserStore) DeleteUser(id string) error                          { return nil }
+func (s *stubUserStore) AssignManager(botID, managerID string) error          { return nil }
+func (s *stubUserStore) UnassignManager(botID, managerID string) error        { return nil }
+func (s *stubUserStore) ListManagers(botID string) ([]ManagerAssignment, error) {
+	return []ManagerAssignment{}, nil
+}
+func (s *stubUserStore) ListManagedBots(managerID string) ([]ManagerAssignment, error) {
+	return []ManagerAssignment{}, nil
+}
+func (s *stubUserStore) ListUsersForManager(managerID string) ([]UserSummary, error) {
+	return []UserSummary{}, nil
+}
+func (s *stubUserStore) IsManagerOf(managerID, botID string) (bool, error) { return false, nil }
 
 // --- helpers ---
 
@@ -506,8 +526,6 @@ func TestManagerRole_AuthEnforcement(t *testing.T) {
 		body   string
 	}{
 		{http.MethodGet, "/admin/audit", ""},
-		{http.MethodGet, "/admin/users", ""},
-		{http.MethodPost, "/admin/users", `{"id":"test@x.com"}`},
 		{http.MethodGet, "/admin/llm-policies", ""},
 		{http.MethodGet, "/admin/evals", ""},
 	}
@@ -543,6 +561,261 @@ func TestManagerRole_AuthEnforcement(t *testing.T) {
 		body := rr.Body.String()
 		if !strings.Contains(body, `"role":"manager"`) {
 			t.Errorf("login should return role:manager, got: %s", body)
+		}
+	})
+}
+
+// TestManagerUserList verifies that managers see a filtered user list and can create bot users.
+func TestManagerUserList(t *testing.T) {
+	api := newTestAPI()
+
+	t.Run("manager_gets_200_on_user_list", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users", managerToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("manager should access GET /admin/users, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_can_create_bot_user", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users", managerToken, `{"id":"newbot@y.com"}`)
+		if rr.Code != http.StatusCreated {
+			t.Errorf("manager should create bot users, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("manager_cannot_create_admin_user", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users", managerToken, `{"id":"x@y.com","role":"admin"}`)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not create admin users, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_cannot_create_manager_user", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users", managerToken, `{"id":"x@y.com","role":"manager"}`)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not create manager users, got %d", rr.Code)
+		}
+	})
+}
+
+// TestManagerBotAssignment_AuthEnforcement verifies auth on manager assignment endpoints.
+func TestManagerBotAssignment_AuthEnforcement(t *testing.T) {
+	api := newTestAPI()
+
+	t.Run("admin_can_assign_manager", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", adminToken, `{"manager_id":"mgr@x.com"}`)
+		if rr.Code != http.StatusCreated {
+			t.Errorf("admin should assign managers, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("manager_cannot_assign_manager", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", managerToken, `{"manager_id":"mgr@x.com"}`)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not assign managers, got %d", rr.Code)
+		}
+	})
+
+	t.Run("no_token_returns_401", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", "", `{"manager_id":"mgr@x.com"}`)
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("no token should return 401, got %d", rr.Code)
+		}
+	})
+
+	t.Run("admin_can_list_managers", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users/bot%40x.com/managers", adminToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("admin should list managers, got %d", rr.Code)
+		}
+	})
+
+	t.Run("unrelated_manager_cannot_list_managers", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users/bot%40x.com/managers", managerToken, "")
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("unrelated manager should get 403, got %d", rr.Code)
+		}
+	})
+
+	t.Run("admin_can_unassign_manager", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodDelete, "/admin/users/bot%40x.com/managers/mgr%40x.com", adminToken, "")
+		// May be 404 (assignment not found in stub) but should not be 401/403
+		if rr.Code == http.StatusUnauthorized || rr.Code == http.StatusForbidden {
+			t.Errorf("admin should pass auth on unassign, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_cannot_unassign", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodDelete, "/admin/users/bot%40x.com/managers/mgr%40x.com", managerToken, "")
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not unassign, got %d", rr.Code)
+		}
+	})
+}
+
+// TestAssignManager_RoleValidation verifies that only users with manager/admin role can be assigned.
+func TestAssignManager_RoleValidation(t *testing.T) {
+	userRoleStore := &roleAwareStubUserStore{
+		roles: map[string]string{
+			"bot@x.com":     "user",
+			"regular@x.com": "user",
+			"mgr@x.com":     "manager",
+		},
+	}
+	validator := &stubValidator{
+		tokens: map[string]stubUser{
+			adminToken: {userID: "admin@example.com", role: "admin"},
+		},
+	}
+	api := NewAPI(
+		&stubAuditReader{},
+		notifications.NewDispatcher(),
+		notifications.NewSSEChannel("web"),
+		validator,
+		userRoleStore,
+	)
+
+	t.Run("reject_user_role_as_manager", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", adminToken, `{"manager_id":"regular@x.com"}`)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("should reject user-role as manager, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("accept_manager_role", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", adminToken, `{"manager_id":"mgr@x.com"}`)
+		if rr.Code != http.StatusCreated {
+			t.Errorf("should accept manager-role, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("reject_nonexistent_manager", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPost, "/admin/users/bot%40x.com/managers", adminToken, `{"manager_id":"ghost@x.com"}`)
+		if rr.Code != http.StatusBadRequest {
+			t.Errorf("should reject nonexistent manager, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+}
+
+// roleAwareStubUserStore returns users with configurable roles for validation tests.
+type roleAwareStubUserStore struct {
+	stubUserStore
+	roles       map[string]string
+	assignments map[string][]string // managerID -> []botID
+}
+
+func (s *roleAwareStubUserStore) GetUser(id string) (*UserDetail, error) {
+	role, exists := s.roles[id]
+	if !exists {
+		return nil, fmt.Errorf("user not found")
+	}
+	return &UserDetail{ID: id, Role: role, Channels: []UserChannelInfo{}, Managers: []ManagerAssignment{}}, nil
+}
+
+func (s *roleAwareStubUserStore) IsManagerOf(managerID, botID string) (bool, error) {
+	if s.assignments == nil {
+		return false, nil
+	}
+	for _, b := range s.assignments[managerID] {
+		if b == botID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// TestMeBots_AuthEnforcement verifies /admin/me/bots requires at least manager role.
+func TestMeBots_AuthEnforcement(t *testing.T) {
+	api := newTestAPI()
+
+	t.Run("admin_can_access", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/me/bots", adminToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("admin should access /admin/me/bots, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_can_access", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/me/bots", managerToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("manager should access /admin/me/bots, got %d", rr.Code)
+		}
+	})
+
+	t.Run("user_gets_403", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/me/bots", nonAdminToken, "")
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("user should get 403 on /admin/me/bots, got %d", rr.Code)
+		}
+	})
+
+	t.Run("no_token_gets_401", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/me/bots", "", "")
+		if rr.Code != http.StatusUnauthorized {
+			t.Errorf("no token should return 401, got %d", rr.Code)
+		}
+	})
+}
+
+// TestManagerGetUserDetail verifies that managers can GET detail of their
+// assigned bots but not unassigned ones.
+func TestManagerGetUserDetail(t *testing.T) {
+	store := &roleAwareStubUserStore{
+		roles: map[string]string{
+			"bot@x.com":     "user",
+			"other@x.com":   "user",
+			"mgr@x.com":     "manager",
+		},
+		assignments: map[string][]string{
+			"mgr@x.com": {"bot@x.com"},
+		},
+	}
+	validator := &stubValidator{
+		tokens: map[string]stubUser{
+			adminToken:   {userID: "admin@example.com", role: "admin"},
+			managerToken: {userID: "mgr@x.com", role: "manager"},
+		},
+	}
+	api := NewAPI(
+		&stubAuditReader{},
+		notifications.NewDispatcher(),
+		notifications.NewSSEChannel("web"),
+		validator,
+		store,
+	)
+
+	t.Run("manager_can_view_assigned_bot", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users/bot%40x.com", managerToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("manager should view assigned bot, got %d: %s", rr.Code, rr.Body.String())
+		}
+	})
+
+	t.Run("manager_cannot_view_unassigned_bot", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users/other%40x.com", managerToken, "")
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not view unassigned bot, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_cannot_update_bot", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodPut, "/admin/users/bot%40x.com", managerToken, `{"role":"admin"}`)
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not update bot, got %d", rr.Code)
+		}
+	})
+
+	t.Run("manager_cannot_delete_bot", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodDelete, "/admin/users/bot%40x.com", managerToken, "")
+		if rr.Code != http.StatusForbidden {
+			t.Errorf("manager should not delete bot, got %d", rr.Code)
+		}
+	})
+
+	t.Run("admin_can_view_any_user", func(t *testing.T) {
+		rr := doRequest(t, api, http.MethodGet, "/admin/users/other%40x.com", adminToken, "")
+		if rr.Code != http.StatusOK {
+			t.Errorf("admin should view any user, got %d: %s", rr.Code, rr.Body.String())
 		}
 	})
 }

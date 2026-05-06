@@ -178,6 +178,7 @@ func (a *API) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/admin/events", a.handleSSE)
 
 	// Identity endpoint
+	mux.HandleFunc("/admin/me/bots", a.handleMeBots)
 	mux.HandleFunc("/admin/me", a.handleMe)
 
 	// Health endpoint (shows pending count)
@@ -276,6 +277,46 @@ func (a *API) handleMe(w http.ResponseWriter, r *http.Request) {
 		"role":     role,
 		"is_admin": role == "admin",
 	})
+}
+
+// handleMeBots returns the bots managed by the authenticated user.
+// For admins, returns all bot (role "user") users since admins manage everything.
+// GET /admin/me/bots
+func (a *API) handleMeBots(w http.ResponseWriter, r *http.Request) {
+	callerID, callerRole, ok := a.requireRole(w, r, "manager")
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if a.userStore == nil {
+		http.Error(w, "User store not available", http.StatusServiceUnavailable)
+		return
+	}
+	var bots []UserSummary
+	var err error
+	if callerRole == "admin" {
+		all, listErr := a.userStore.ListUsers()
+		if listErr != nil {
+			respondError(w, http.StatusInternalServerError, "failed to list users", listErr)
+			return
+		}
+		bots = make([]UserSummary, 0, len(all))
+		for _, u := range all {
+			if u.Role == "user" {
+				bots = append(bots, u)
+			}
+		}
+	} else {
+		bots, err = a.userStore.ListUsersForManager(callerID)
+		if err != nil {
+			respondError(w, http.StatusInternalServerError, "failed to list managed bots", err)
+			return
+		}
+	}
+	respondJSON(w, http.StatusOK, bots)
 }
 
 // handleAuditLog returns audit entries with optional filters
@@ -383,17 +424,26 @@ func (a *API) handleHealth(w http.ResponseWriter, r *http.Request) {
 }
 
 // handleUsers handles GET /admin/users (list) and POST /admin/users (create).
+// GET is accessible to managers (returns only assigned bots) and admins (full list).
+// POST is accessible to managers (creates bot users auto-assigned to caller) and admins (any role).
 func (a *API) handleUsers(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireAdmin(w, r); !ok {
-		return
-	}
 	if a.userStore == nil {
 		http.Error(w, "User store not available", http.StatusServiceUnavailable)
 		return
 	}
+	callerID, callerRole, ok := a.requireRole(w, r, "manager")
+	if !ok {
+		return
+	}
 	switch r.Method {
 	case http.MethodGet:
-		users, err := a.userStore.ListUsers()
+		var users []UserSummary
+		var err error
+		if callerRole == "admin" {
+			users, err = a.userStore.ListUsers()
+		} else {
+			users, err = a.userStore.ListUsersForManager(callerID)
+		}
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, "failed to list users", err)
 			return
@@ -413,10 +463,28 @@ func (a *API) handleUsers(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "invalid role: must be admin, manager, or user", http.StatusBadRequest)
 			return
 		}
+		// Managers can only create bot users (role "user").
+		if callerRole != "admin" {
+			userRole := "user"
+			if req.Role != nil && *req.Role != "user" {
+				http.Error(w, "managers can only create bot users", http.StatusForbidden)
+				return
+			}
+			req.Role = &userRole
+		}
 		user, err := a.userStore.CreateUser(req)
 		if err != nil {
 			respondError(w, http.StatusInternalServerError, "failed to create user", err)
 			return
+		}
+		// Auto-assign the manager to the newly created bot.
+		if callerRole != "admin" {
+			if assignErr := a.userStore.AssignManager(user.ID, callerID); assignErr != nil {
+				// Roll back: delete the orphan user so it doesn't become invisible.
+				_ = a.userStore.DeleteUser(user.ID)
+				respondError(w, http.StatusInternalServerError, "failed to assign manager to new bot", assignErr)
+				return
+			}
 		}
 		respondJSON(w, http.StatusCreated, user)
 	default:
@@ -424,18 +492,14 @@ func (a *API) handleUsers(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleUserAction routes /admin/users/{email}.
+// handleUserAction routes /admin/users/{email} and /admin/users/{email}/managers[/{manager_id}].
 func (a *API) handleUserAction(w http.ResponseWriter, r *http.Request) {
-	if _, ok := a.requireAdmin(w, r); !ok {
-		return
-	}
 	if a.userStore == nil {
 		http.Error(w, "User store not available", http.StatusServiceUnavailable)
 		return
 	}
 
 	const prefix = "/admin/users/"
-	// Use RawPath when available so we unescape exactly once.
 	rawPath := r.URL.RawPath
 	if rawPath == "" {
 		rawPath = r.URL.Path
@@ -446,14 +510,45 @@ func (a *API) handleUserAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	email, err := url.PathUnescape(remaining)
+	// Split remaining into user ID and optional sub-resource.
+	// e.g. "bob%40x.com/managers/alice%40x.com" → id="bob@x.com", sub="/managers/alice@x.com"
+	idPart := remaining
+	subPath := ""
+	if idx := strings.Index(remaining, "/"); idx > 0 {
+		idPart = remaining[:idx]
+		subPath = remaining[idx:]
+	}
+
+	email, err := url.PathUnescape(idPart)
 	if err != nil || email == "" {
 		http.Error(w, "Invalid user ID", http.StatusBadRequest)
 		return
 	}
 
+	if strings.HasPrefix(subPath, "/managers") {
+		a.handleUserManagers(w, r, email, subPath)
+		return
+	}
+	if subPath != "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	// Auth: at minimum require manager role; PUT/DELETE further require admin.
+	callerID, callerRole, ok := a.requireRole(w, r, "manager")
+	if !ok {
+		return
+	}
+
 	switch r.Method {
 	case http.MethodGet:
+		if callerRole != "admin" {
+			isMgr, mgrErr := a.userStore.IsManagerOf(callerID, email)
+			if mgrErr != nil || !isMgr {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+		}
 		user, err := a.userStore.GetUser(email)
 		if err != nil {
 			respondError(w, http.StatusNotFound, "user not found", err)
@@ -461,6 +556,10 @@ func (a *API) handleUserAction(w http.ResponseWriter, r *http.Request) {
 		}
 		respondJSON(w, http.StatusOK, user)
 	case http.MethodPut:
+		if callerRole != "admin" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		limitBody(w, r, maxBodySize)
 		var req UpdateUserRequest
 		if !decodeBody(w, r, &req) {
@@ -488,6 +587,10 @@ func (a *API) handleUserAction(w http.ResponseWriter, r *http.Request) {
 		}
 		respondJSON(w, http.StatusOK, user)
 	case http.MethodDelete:
+		if callerRole != "admin" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
 		if err := a.userStore.DeleteUser(email); err != nil {
 			respondError(w, http.StatusNotFound, "user not found", err)
 			return
@@ -495,6 +598,107 @@ func (a *API) handleUserAction(w http.ResponseWriter, r *http.Request) {
 		respondJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+// handleUserManagers handles /admin/users/{id}/managers and /admin/users/{id}/managers/{manager_id}.
+// GET /admin/users/{id}/managers — list managers (admin or manager-of)
+// POST /admin/users/{id}/managers — assign manager (admin only)
+// DELETE /admin/users/{id}/managers/{manager_id} — unassign (admin only)
+func (a *API) handleUserManagers(w http.ResponseWriter, r *http.Request, botID string, subPath string) {
+	callerID, callerRole, ok := a.requireRole(w, r, "manager")
+	if !ok {
+		return
+	}
+
+	// subPath is "/managers" or "/managers/{manager_id}"
+	managerSuffix := strings.TrimPrefix(subPath, "/managers")
+
+	switch {
+	case managerSuffix == "" || managerSuffix == "/":
+		switch r.Method {
+		case http.MethodGet:
+			if callerRole != "admin" {
+				isMgr, err := a.userStore.IsManagerOf(callerID, botID)
+				if err != nil || !isMgr {
+					http.Error(w, "Forbidden", http.StatusForbidden)
+					return
+				}
+			}
+			managers, err := a.userStore.ListManagers(botID)
+			if err != nil {
+				respondError(w, http.StatusInternalServerError, "failed to list managers", err)
+				return
+			}
+			respondJSON(w, http.StatusOK, managers)
+		case http.MethodPost:
+			if callerRole != "admin" {
+				http.Error(w, "Forbidden", http.StatusForbidden)
+				return
+			}
+			limitBody(w, r, maxBodySize)
+			var body struct {
+				ManagerID string `json:"manager_id"`
+			}
+			if !decodeBody(w, r, &body) {
+				return
+			}
+			if body.ManagerID == "" {
+				http.Error(w, "manager_id is required", http.StatusBadRequest)
+				return
+			}
+			// Validate bot exists and has "user" role (only bots can have managers).
+			bot, err := a.userStore.GetUser(botID)
+			if err != nil {
+				http.Error(w, "bot user not found", http.StatusNotFound)
+				return
+			}
+			if bot.Role != "user" {
+				http.Error(w, "managers can only be assigned to bot users", http.StatusBadRequest)
+				return
+			}
+			// Validate manager exists and has an appropriate role.
+			mgr, err := a.userStore.GetUser(body.ManagerID)
+			if err != nil {
+				http.Error(w, "manager user not found", http.StatusBadRequest)
+				return
+			}
+			if mgr.Role != "manager" && mgr.Role != "admin" {
+				http.Error(w, "user must have manager or admin role", http.StatusBadRequest)
+				return
+			}
+			if err := a.userStore.AssignManager(botID, body.ManagerID); err != nil {
+				respondError(w, http.StatusInternalServerError, "failed to assign manager", err)
+				return
+			}
+			respondJSON(w, http.StatusCreated, map[string]string{"status": "assigned"})
+		default:
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+
+	case strings.HasPrefix(managerSuffix, "/"):
+		// DELETE /admin/users/{id}/managers/{manager_id}
+		if r.Method != http.MethodDelete {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if callerRole != "admin" {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		managerID, err := url.PathUnescape(managerSuffix[1:])
+		if err != nil || managerID == "" {
+			http.Error(w, "Invalid manager ID", http.StatusBadRequest)
+			return
+		}
+		if err := a.userStore.UnassignManager(botID, managerID); err != nil {
+			respondError(w, http.StatusNotFound, "assignment not found", err)
+			return
+		}
+		respondJSON(w, http.StatusOK, map[string]string{"status": "unassigned"})
+
+	default:
+		http.NotFound(w, r)
 	}
 }
 
